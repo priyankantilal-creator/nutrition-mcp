@@ -39,6 +39,13 @@ import {
     type WaterEntry,
     type WeightEntry,
 } from "./supabase.js";
+import {
+    upsertDailyLog,
+    getDailyLogByDate,
+    getDailyLogInRange,
+    formatDailyLog,
+    formatFieldList,
+} from "./daily-log.js";
 import { withAnalytics } from "./analytics.js";
 import {
     todayInTz,
@@ -46,6 +53,7 @@ import {
     shiftLocalDate,
     dateInTz,
     validateLoggedAt,
+    zonedHourUtc,
 } from "./tz.js";
 import {
     buildDailyBuckets,
@@ -2703,6 +2711,327 @@ export function registerTools(
                     };
                 },
                 { userId },
+            );
+        },
+    );
+
+    server.registerTool(
+        "log_daily_metrics",
+        {
+            title: "Log Daily Health Metrics",
+            description:
+                "Log the daily health-log metrics for a day: mood, stress, meditation, recovery score, body measurements, alcohol, caffeine cutoff, digestion, blood pressure, blood sugar, illness and notes. One row per day — calling this repeatedly through the day MERGES into that day's row, so you only need to pass the fields the user just mentioned; everything already logged is preserved. Pass a field as null to explicitly clear it. `weight` and `water_ml` are accepted here for convenience but are routed to the weight and water logs (the same stores log_weight and log_water write to), not to the daily row. Defaults to today in the user's timezone; if you don't know the current date, ask the user before calling.",
+            annotations: {
+                readOnlyHint: false,
+                destructiveHint: false,
+                idempotentHint: true,
+                openWorldHint: false,
+            },
+            inputSchema: {
+                date: z
+                    .string()
+                    .optional()
+                    .describe(
+                        "Date in YYYY-MM-DD format. Defaults to today in the user's timezone.",
+                    ),
+                physical_mood: z
+                    .enum(["high", "medium", "low"])
+                    .nullable()
+                    .optional()
+                    .describe("How the body felt."),
+                mental_mood: z
+                    .enum(["high", "medium", "low"])
+                    .nullable()
+                    .optional()
+                    .describe("How the head felt."),
+                stress: z
+                    .enum(["high", "medium", "low"])
+                    .nullable()
+                    .optional()
+                    .describe("Stress level."),
+                meditation_mins: z.coerce
+                    .number()
+                    .int()
+                    .min(0)
+                    .nullable()
+                    .optional()
+                    .describe("Minutes meditated."),
+                recovery: z.coerce
+                    .number()
+                    .int()
+                    .min(1)
+                    .max(10)
+                    .nullable()
+                    .optional()
+                    .describe("Subjective recovery, 1-10."),
+                waist_in: z.coerce
+                    .number()
+                    .positive()
+                    .nullable()
+                    .optional()
+                    .describe("Waist measurement in inches."),
+                hips_in: z.coerce
+                    .number()
+                    .positive()
+                    .nullable()
+                    .optional()
+                    .describe("Hips measurement in inches."),
+                chest_in: z.coerce
+                    .number()
+                    .positive()
+                    .nullable()
+                    .optional()
+                    .describe("Chest measurement in inches."),
+                thigh_in: z.coerce
+                    .number()
+                    .positive()
+                    .nullable()
+                    .optional()
+                    .describe("Thigh measurement in inches."),
+                arm_in: z.coerce
+                    .number()
+                    .positive()
+                    .nullable()
+                    .optional()
+                    .describe("Arm measurement in inches."),
+                alcohol_units: z.coerce
+                    .number()
+                    .min(0)
+                    .nullable()
+                    .optional()
+                    .describe("UK alcohol units consumed."),
+                caffeine_cutoff: z
+                    .string()
+                    .nullable()
+                    .optional()
+                    .describe(
+                        "Time of last caffeine, 24-hour HH:MM (e.g. '14:30').",
+                    ),
+                stools: z.coerce
+                    .number()
+                    .int()
+                    .min(0)
+                    .nullable()
+                    .optional()
+                    .describe("Number of bowel movements."),
+                stool_quality: z
+                    .enum(["loose", "regular", "solid"])
+                    .nullable()
+                    .optional(),
+                bloating: z
+                    .enum(["none", "mild", "moderate", "severe"])
+                    .nullable()
+                    .optional(),
+                bp_systolic: z.coerce
+                    .number()
+                    .int()
+                    .min(50)
+                    .max(260)
+                    .nullable()
+                    .optional(),
+                bp_diastolic: z.coerce
+                    .number()
+                    .int()
+                    .min(30)
+                    .max(200)
+                    .nullable()
+                    .optional(),
+                blood_sugar: z.coerce
+                    .number()
+                    .min(0)
+                    .nullable()
+                    .optional()
+                    .describe("Blood glucose reading."),
+                illness: z
+                    .string()
+                    .nullable()
+                    .optional()
+                    .describe("Any symptoms or illness, free text."),
+                notes: z
+                    .string()
+                    .nullable()
+                    .optional()
+                    .describe("Free-text notes for the day."),
+                weight: z.coerce
+                    .number()
+                    .positive()
+                    .optional()
+                    .describe(
+                        "Body weight. Routed to the weight log, not the daily row. Pass the value in whatever unit the user stated and set `weight_unit`; do NOT convert yourself.",
+                    ),
+                weight_unit: z
+                    .enum(["kg", "lb"])
+                    .optional()
+                    .describe(
+                        "Unit for `weight`. Defaults to the user's preferred weight unit.",
+                    ),
+                water_ml: z.coerce
+                    .number()
+                    .positive()
+                    .optional()
+                    .describe(
+                        "Fluid intake in millilitres. Routed to the water log, not the daily row.",
+                    ),
+            },
+        },
+        async (args) => {
+            return withAnalytics(
+                "log_daily_metrics",
+                async () => {
+                    const tz = await getUserTimezone(userId);
+                    const logDate = args.date ?? todayInTz(tz);
+
+                    const {
+                        date: _date,
+                        weight,
+                        weight_unit,
+                        water_ml,
+                        ...fields
+                    } = args;
+
+                    const lines: string[] = [];
+
+                    // Weight and water are routed to their own tables so the
+                    // existing trend tooling sees one canonical series.
+                    if (weight !== undefined) {
+                        const unit = await resolveWriteWeightUnit(
+                            userId,
+                            weight_unit,
+                        );
+                        const weight_g = toGrams(weight, unit);
+                        assertPlausibleWeight(weight_g, unit);
+                        const loggedAt =
+                            logDate === todayInTz(tz)
+                                ? undefined
+                                : zonedHourUtc(logDate, tz, 8).toISOString();
+                        const { entry, deduplicated } = await insertWeight(
+                            userId,
+                            { weight_g, logged_at: loggedAt },
+                        );
+                        lines.push(
+                            `${deduplicated ? "Weight already logged" : "Weight logged"}: ${formatWeight(entry.weight_g, unit)} (weight log)`,
+                        );
+                    }
+
+                    if (water_ml !== undefined) {
+                        const loggedAt =
+                            logDate === todayInTz(tz)
+                                ? undefined
+                                : zonedHourUtc(logDate, tz, 12).toISOString();
+                        const { entry, deduplicated } = await insertWater(
+                            userId,
+                            { amount_ml: Math.round(water_ml), logged_at: loggedAt },
+                        );
+                        lines.push(
+                            `${deduplicated ? "Water already logged" : "Water logged"}: ${entry.amount_ml}ml (water log)`,
+                        );
+                    }
+
+                    const hasDailyFields = Object.values(fields).some(
+                        (v) => v !== undefined,
+                    );
+
+                    if (hasDailyFields) {
+                        const { entry, created, changed, overwritten } =
+                            await upsertDailyLog(userId, logDate, fields);
+                        lines.push(
+                            `${created ? "Created" : "Updated"} daily log for ${entry.log_date} — set ${formatFieldList(changed)}.`,
+                        );
+                        if (overwritten.length > 0)
+                            lines.push(
+                                `Replaced previously logged values for: ${formatFieldList(overwritten)}.`,
+                            );
+                    }
+
+                    if (lines.length === 0)
+                        throw new Error(
+                            "No fields supplied — nothing to log.",
+                        );
+
+                    return {
+                        content: [{ type: "text", text: lines.join("\n") }],
+                    };
+                },
+                { userId },
+            );
+        },
+    );
+
+    server.registerTool(
+        "get_daily_log",
+        {
+            title: "Get Daily Health Log",
+            description:
+                "Get the daily health-log metrics (mood, stress, recovery, measurements, digestion, BP, notes) for a single date, or for a date range if `end_date` is supplied. Note that weight and water live in the weight and water logs — use get_weight_by_date / get_water_by_date or the weight trend tools for those.",
+            annotations: {
+                readOnlyHint: true,
+                destructiveHint: false,
+                idempotentHint: true,
+                openWorldHint: false,
+            },
+            inputSchema: {
+                date: z
+                    .string()
+                    .optional()
+                    .describe(
+                        "Date in YYYY-MM-DD format. Defaults to today in the user's timezone.",
+                    ),
+                end_date: z
+                    .string()
+                    .optional()
+                    .describe(
+                        "Optional end date in YYYY-MM-DD format. When supplied, returns every logged day from `date` to `end_date` inclusive.",
+                    ),
+            },
+        },
+        async ({ date, end_date }) => {
+            return withAnalytics(
+                "get_daily_log",
+                async () => {
+                    const tz = await getUserTimezone(userId);
+                    const start = date ?? todayInTz(tz);
+
+                    if (end_date) {
+                        const entries = await getDailyLogInRange(
+                            userId,
+                            start,
+                            end_date,
+                        );
+                        if (entries.length === 0)
+                            return {
+                                content: [
+                                    {
+                                        type: "text",
+                                        text: `No daily log entries between ${start} and ${end_date}.`,
+                                    },
+                                ],
+                            };
+                        return {
+                            content: [
+                                {
+                                    type: "text",
+                                    text: entries
+                                        .map(formatDailyLog)
+                                        .join("\n\n---\n\n"),
+                                },
+                            ],
+                        };
+                    }
+
+                    const entry = await getDailyLogByDate(userId, start);
+                    return {
+                        content: [
+                            {
+                                type: "text",
+                                text: entry
+                                    ? formatDailyLog(entry)
+                                    : `No daily log entry for ${start}.`,
+                            },
+                        ],
+                    };
+                },
+                { userId },
+                { date: date ?? null },
             );
         },
     );
